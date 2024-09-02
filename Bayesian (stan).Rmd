@@ -1,0 +1,744 @@
+---
+title: "Bayesian (Proper)"
+output: pdf_document
+date: "2024-08-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/lukeconkleton/Library/Mobile Documents/com~apple~CloudDocs/Documents/UCL Project/Data")
+```
+
+
+```{r, include=FALSE}
+library(tidyverse)
+library(rstan)
+library(reshape2)
+library(tidyr)
+library(gridExtra)
+library(grid)
+library(ggridges)
+```
+
+#############################################################################
+#############################################################################
+
+```{r}
+rounds_data <- readRDS("roundData2018-2022.rds")
+odds_data <- readRDS("oddsData2018-2022.rds")
+```
+
+## 1. DATA WRANGLING & FEATURE SELECTION
+
+Subsetting dataframe to only include pre-covid data. Creating a new dataframe to only inlcude variables of interest; golfer, tournament, major, final position and date.
+
+```{r}
+rounds_data <- rounds_data %>% filter(year %in% c('2018', '2019'))
+```
+
+Engineering a feature for whether or not the golfer is playing at 'home':
+
+```{r}
+rounds_data$is.home <- ifelse(rounds_data$player_country == rounds_data$tournament_country, 1, 0)
+```
+
+```{r}
+rounds <- data.frame(
+  EP_game_id = rounds_data$EP_game_id,
+  tournament = rounds_data$event_name,
+  major = rounds_data$is_major,
+  golfer_id = rounds_data$player_id,
+  golfer = rounds_data$player_name,
+  final_position = rounds_data$final_position,
+  start_date = rounds_data$competition_start_date, 
+  times_played_course = rounds_data$times_played_course,
+  is.home = rounds_data$is.home
+)
+
+rounds <- rounds %>%
+  distinct()
+```
+
+Only keeping a variable for times played course pre-tournament.
+
+```{r}
+rounds <- rounds %>%
+  group_by(EP_game_id, tournament, golfer_id, start_date) %>%
+  slice_min(times_played_course) %>% #takes the minimum value of the datapoints
+  ungroup() %>%
+  rename(times_played_course_pre_tournament = times_played_course)
+```
+
+
+
+Only considering the relevant time frame:
+
+```{r}
+odds_data$competition_start_date <- as.Date(odds_data$competition_start_date)
+
+odds_data <- odds_data %>% filter(format(competition_start_date, "%Y") %in% c("2018", "2019"))
+
+odds_data <- odds_data %>%
+  select(EP_game_id, event_name, SMARTODDS_golfer1_name, SMARTODDS_golfer2_name, golfer1_win, golfer2_win) %>%
+  rename(
+    player1 = SMARTODDS_golfer1_name,
+    player2 = SMARTODDS_golfer2_name,
+    tournament = event_name
+  )
+```
+
+More tournaments included in rounds data set comparatively:
+
+```{r}
+length(unique(odds_data$EP_game_id))
+length(unique(rounds_data$EP_game_id))
+```
+
+How many times does each golfer appear in the odds dataframe?
+
+a)  Subsetting the rounds dataset to only include golfers who have made over 'x' appearances in the odds dataset:
+
+```{r}
+odds_golfers <- c(odds_data$player1, odds_data$player2)
+length(unique(odds_golfers))
+
+# how many appearances in the odds data frame
+golfer_counts <- data.frame(golfer = odds_golfers) %>%
+  group_by(golfer) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+golfer_counts
+
+players_over_50 <- golfer_counts %>%
+  filter(count >= 50)
+
+dim(players_over_50)
+```
+
+
+```{r}
+# filter the original dataframe to keep only those players
+filtered_rounds_data <- rounds_data %>%
+  filter(player_name %in% players_over_50$golfer)
+
+# filter Rounds Dataframe
+
+filtered_rounds <- rounds %>%
+  filter(golfer %in% players_over_50$golfer) %>%
+  filter(!is.na(final_position) & final_position != 0)
+```
+
+## 2. CREATING A PAIRWISE COMPARISON DATASET
+
+Create a dataset with every single match-up in that time period. 
+
+
+```{r}
+# define the create_pairs function
+create_pairs <- function(df) {
+  pairs <- expand.grid(golfer_A = df$golfer_id, golfer_B = df$golfer_id)
+  pairs <- pairs[pairs$golfer_A != pairs$golfer_B, ]
+  
+  golfer_A_indices <- match(pairs$golfer_A, df$golfer_id)
+  golfer_B_indices <- match(pairs$golfer_B, df$golfer_id)
+  
+  if (length(golfer_A_indices) == 0 || length(golfer_B_indices) == 0) {
+    return(data.frame())
+  }
+  
+  result <- data.frame(
+    golfer_A = df$golfer[golfer_A_indices],
+    golfer_B = df$golfer[golfer_B_indices],
+    final_position_A = df$final_position[golfer_A_indices],
+    final_position_B = df$final_position[golfer_B_indices],
+    start_date = df$start_date[golfer_A_indices],
+    major = df$major[golfer_A_indices],
+    EP_game_id = df$EP_game_id[golfer_A_indices],
+    tournament = df$tournament[golfer_A_indices],
+    playerA_times_played = df$times_played_course_pre_tournament[golfer_A_indices],
+    playerB_times_played = df$times_played_course_pre_tournament[golfer_B_indices],
+    is.home.A = df$is.home[golfer_A_indices],
+    is.home.B = df$is.home[golfer_B_indices]
+  )
+  
+  return(result)
+}
+
+# apply the function to each tournament
+pairwise_matches <- filtered_rounds %>%
+  group_by(EP_game_id) %>%
+  do({
+    result <- create_pairs(.)
+    if (nrow(result) > 0) {
+      result$EP_game_id <- .$EP_game_id[1]
+    }
+    result
+  }) %>%
+  ungroup()
+
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    result_A = ifelse(final_position_A < final_position_B, 1, 0),
+    result_B = ifelse(final_position_B < final_position_A, 1, 0)
+  )
+
+```
+
+Ensure that there are no duplicate results in the dataset and that the data is ordered temporally. Will need to be amended if adding variables.
+
+```{r}
+# ensure each pair is in a consistent order
+pairwise_matches <- pairwise_matches %>%
+  rowwise() %>%
+  mutate(
+    golfer_A_sorted = ifelse(golfer_A < golfer_B, golfer_A, golfer_B),
+    golfer_B_sorted = ifelse(golfer_A < golfer_B, golfer_B, golfer_A),
+    final_position_A_sorted = ifelse(golfer_A < golfer_B, final_position_A, final_position_B),
+    final_position_B_sorted = ifelse(golfer_A < golfer_B, final_position_B, final_position_A),
+    result_A_sorted = ifelse(golfer_A < golfer_B, result_A, result_B),
+    result_B_sorted = ifelse(golfer_A < golfer_B, result_B, result_A),
+    is.home_A_sorted = ifelse(golfer_A < golfer_B, is.home.A, is.home.B),
+    is.home_B_sorted = ifelse(golfer_A < golfer_B, is.home.B, is.home.A),
+    times_played_A_sorted = ifelse(golfer_A < golfer_B, playerA_times_played, playerB_times_played),
+    times_played_B_sorted = ifelse(golfer_A < golfer_B, playerB_times_played, playerA_times_played)
+  ) %>%
+  ungroup()
+
+# add home advantage columns after sorting
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    home_advantage_A = ifelse(is.home_A_sorted == 1 & is.home_B_sorted == 0, 1, 0),
+    home_advantage_B = ifelse(is.home_A_sorted == 0 & is.home_B_sorted == 1, 1, 0)
+  )
+
+# remove duplicates based on the sorted pairs and the tournament
+pairwise_matches <- pairwise_matches %>%
+  select(EP_game_id, tournament, golfer_A_sorted, golfer_B_sorted, final_position_A_sorted, final_position_B_sorted, 
+         result_A_sorted, result_B_sorted, start_date, major, times_played_A_sorted, times_played_B_sorted, 
+         is.home_A_sorted, is.home_B_sorted, home_advantage_A, home_advantage_B) %>%
+  distinct() %>%
+  rename(
+    golfer_A = golfer_A_sorted,
+    golfer_B = golfer_B_sorted,
+    final_position_A = final_position_A_sorted,
+    final_position_B = final_position_B_sorted,
+    result_A = result_A_sorted,
+    result_B = result_B_sorted,
+    is.home_A = is.home_A_sorted,
+    is.home_B = is.home_B_sorted,
+    times_played_A = times_played_A_sorted,
+    times_played_B = times_played_B_sorted
+  )
+
+# ensuring proper column naming for clarity
+pairwise_matches <- pairwise_matches %>%
+  rename(
+    player1 = golfer_A,
+    player2 = golfer_B,
+    score1 = result_A,
+    score2 = result_B
+  )
+
+# maintaining temporal ordering and then by game ID for tournaments that start on same day
+pairwise_matches <- pairwise_matches %>%
+  arrange(start_date, EP_game_id)
+```
+
+#############################################################################
+#############################################################################
+
+Creating tournament summary for which tournaments come before and after:
+
+```{r}
+tournament_summary <- pairwise_matches %>%
+  group_by(tournament, EP_game_id, major, start_date) %>%
+  summarise() %>%
+  ungroup() %>%
+  arrange(start_date, EP_game_id) %>%
+  mutate(
+    next_EP_game_id = lead(EP_game_id),
+    next_tournament = lead(tournament),
+    next_major = lead(major),
+    next_start_date = lead(start_date),
+    prev_EP_game_id = lag(EP_game_id),
+    prev_tournament = lag(tournament),
+    prev_major = lag(major),
+    prev_start_date = lag(start_date)
+  ) %>%
+  filter(!is.na(next_EP_game_id) | row_number() == n()) 
+
+```
+
+Cutting down pairwise_matches dataset to only include tournament details, player1, player2 and outcome:
+
+```{r}
+pairwise_matches <- pairwise_matches %>%
+  select(EP_game_id, tournament, start_date, player1, player2, score1) %>%
+  rename(outcome = score1)
+```
+
+Need to work with player indexes in stan:
+
+```{r}
+player_names <- unique(c(pairwise_matches$player1, pairwise_matches$player2))
+player_indices <- setNames(seq_along(player_names), player_names)
+
+pairwise_matches$player1 <- as.numeric(player_indices[pairwise_matches$player1])
+pairwise_matches$player2 <- as.numeric(player_indices[pairwise_matches$player2])
+
+num_players <- length(player_names)
+
+print(player_indices)  
+```
+
+Split the data into training and updating sets:
+
+```{r}
+length(unique(pairwise_matches$EP_game_id))
+
+training_tournaments <- unique(pairwise_matches$EP_game_id)[1:80]
+updating_tournaments <- unique(pairwise_matches$EP_game_id)[81:148]
+length(updating_tournaments)
+
+training_set <- pairwise_matches[pairwise_matches$EP_game_id %in% training_tournaments, ]
+updating_set <- pairwise_matches[pairwise_matches$EP_game_id %in% updating_tournaments, ]
+```
+Creating batches for the tournaments:
+
+```{r}
+updating_batches <- list()
+
+batch_size <- 10
+num_batches <- length(updating_tournaments) %/% batch_size
+
+# split the updating tournaments into batches
+for (i in 1:num_batches) {
+  start_idx <- (i - 1) * batch_size + 1
+  end_idx <- i * batch_size
+  updating_batches[[i]] <- updating_tournaments[start_idx:end_idx]
+}
+
+# if there are remaining tournaments that don't fit exactly into a batch
+if (length(updating_tournaments) %% batch_size != 0) {
+  updating_batches[[num_batches + 1]] <- updating_tournaments[(num_batches * batch_size + 1):length(updating_tournaments)]
+}
+
+```
+
+
+## STAN MODELLING
+
+Calculating the initial strengths post-training. Include final tournament of training set in.
+
+```{r, message = FALSE}
+# prepare the data for Stan
+stan_data <- list(
+  N = nrow(training_set),  # Number of matchups
+  P = num_players,         # Number of players
+  player1 = training_set$player1,  # Player 1 indices
+  player2 = training_set$player2,  # Player 2 indices
+  outcome = training_set$outcome   # Match outcomes
+)
+
+stan_model <- stan_model(file = "bradley_terry_model.stan")
+
+fit <- sampling(stan_model,
+                data = stan_data,
+                iter = 2000,
+                warmup = 1000,
+                chains = 2,
+                control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+initial_posterior_samples <- extract(fit)
+
+log_theta_samples_for_batch_1 <- initial_posterior_samples$log_theta   
+mu_samples_for_batch_1 <- initial_posterior_samples$mu                 
+tau_samples_for_batch_1 <- initial_posterior_samples$tau               
+lambda_samples_for_batch_1 <- initial_posterior_samples$lambda         
+unshrunk_log_theta_samples_for_batch_1 <- initial_posterior_samples$log_theta_raw 
+
+```
+
+```{r}
+fit
+```
+Example Traceplots:
+
+```{r}
+traceplot(fit, pars = c( "mu", "tau"))
+```
+
+
+Ridge Plotting:
+
+```{r}
+# for first 4 players
+unshrunk_log_theta_samples <- initial_posterior_samples$log_theta_raw[, 1:4]
+shrunk_log_theta_samples <- initial_posterior_samples$log_theta[, 1:4]
+
+unshrunk_log_theta_df <- melt(unshrunk_log_theta_samples)
+colnames(unshrunk_log_theta_df) <- c("Iteration", "Player", "Log_Ability")
+
+shrunk_log_theta_df <- melt(shrunk_log_theta_samples)
+colnames(shrunk_log_theta_df) <- c("Iteration", "Player", "Log_Ability")
+
+
+
+# find the range of x values
+x_min <- min(c(unshrunk_log_theta_df$Log_Ability, shrunk_log_theta_df$Log_Ability))
+x_max <- max(c(unshrunk_log_theta_df$Log_Ability, shrunk_log_theta_df$Log_Ability))
+
+# ridge plot for unshrunk log abilities
+ridge_plot_unshrunk <- ggplot(unshrunk_log_theta_df, aes(x = Log_Ability, y = as.factor(Player), fill = as.factor(Player))) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01) +
+  labs(x = "Unshrunk Log Ability", y = "Player") +
+  theme_ridges() +
+  theme(legend.position = "none") +
+  coord_cartesian(xlim = c(x_min, x_max))  # Set common x-axis limits
+
+# ridge plot for shrunk log abilities
+ridge_plot_shrunk <- ggplot(shrunk_log_theta_df, aes(x = Log_Ability, y = as.factor(Player), fill = as.factor(Player))) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01) +
+  labs(x = "Shrunk Log Ability", y = "Player") +
+  theme_ridges() +
+  theme(legend.position = "none") +
+  coord_cartesian(xlim = c(x_min, x_max))  # Set common x-axis limits
+
+combined_plot <- grid.arrange(
+  ridge_plot_unshrunk, ridge_plot_shrunk,
+  ncol = 2,
+  top = textGrob("Comparison of Unshrunk and Shrunk Log Abilities for First Four Players", 
+                 gp = gpar(fontsize = 15, fontface = "bold"))
+)
+```
+For tau and lambda_i:
+
+```{r}
+tau_samples <- initial_posterior_samples$tau
+lambda_samples <- initial_posterior_samples$lambda[, 1:4]
+mu_samples <- initial_posterior_samples$mu
+
+combined_samples <- data.frame(
+  Iteration = 1:length(tau_samples),
+  Mu = mu_samples,
+  Tau = tau_samples,
+  Lambda_1 = lambda_samples[, 1],
+  Lambda_2 = lambda_samples[, 2],
+  Lambda_3 = lambda_samples[, 3],
+  Lambda_4 = lambda_samples[, 4]
+)
+
+# melt the data into a long format for ggplot
+melted_samples <- melt(combined_samples, id.vars = "Iteration", 
+                               variable.name = "Parameter", value.name = "Value")
+
+# create the ridge plot
+ridge_plot <- ggplot(melted_samples, aes(x = Value, y = Parameter, fill = Parameter)) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01) +
+  labs(x = "Parameter Value", y = "Parameter", title = "Post-Training Posterior Distributions") +
+  theme_ridges() +
+  theme(legend.position = "none")
+
+print(ridge_plot_with_mu)
+```
+
+Batch Training!! Every 10 tournaments
+
+```{r}
+# initialize lists to store samples for each batch
+log_theta_samples_list <- list()
+mu_samples_list <- list()
+tau_samples_list <- list()
+lambda_samples_list <- list()
+
+# store initial training phase samples as the first batch in the lists
+log_theta_samples_list[[1]] <- log_theta_samples_for_batch_1
+mu_samples_list[[1]] <- mu_samples_for_batch_1
+tau_samples_list[[1]] <- tau_samples_for_batch_1
+lambda_samples_list[[1]] <- lambda_samples_for_batch_1
+
+print("Starting batch processing...")
+
+for (batch_num in 1:length(updating_batches)) {
+  print(paste("Processing batch:", batch_num))
+  
+  # prepare data for the current batch
+  current_batch_data <- pairwise_matches[pairwise_matches$EP_game_id %in% updating_batches[[batch_num]], ]
+  
+  stan_data <- list(
+    N = nrow(current_batch_data),
+    P = num_players,
+    player1 = current_batch_data$player1,
+    player2 = current_batch_data$player2,
+    outcome = current_batch_data$outcome
+  )
+  
+  # create separate initial values for each chain using values from the last batch
+  init_values_chain_1 <- list(
+    mu = sample(mu_samples_list[[batch_num]], 1),
+    tau = sample(tau_samples_list[[batch_num]], 1),
+    lambda = apply(lambda_samples_list[[batch_num]], 2, function(x) sample(x, 1)),
+    log_theta_raw = apply(log_theta_samples_list[[batch_num]], 2, function(x) sample(x, 1))
+  )
+  
+  init_values_chain_2 <- list(
+    mu = sample(mu_samples_list[[batch_num]], 1),
+    tau = sample(tau_samples_list[[batch_num]], 1),
+    lambda = apply(lambda_samples_list[[batch_num]], 2, function(x) sample(x, 1)),
+    log_theta_raw = apply(log_theta_samples_list[[batch_num]], 2, function(x) sample(x, 1))
+  )
+  
+  # run the Stan model with the current batch data
+  fit <- sampling(
+    stan_model,
+    data = stan_data,
+    iter = 2000,  
+    warmup = 1000, 
+    chains = 2,
+    control = list(adapt_delta = 0.999, max_treedepth = 20),
+    init = list(init_values_chain_1, init_values_chain_2)
+  )
+  
+  # extract the updated posterior samples
+  updated_samples <- extract(fit)
+  
+  # store the updated samples in the list for the next iteration
+  log_theta_samples_list[[batch_num + 1]] <- updated_samples$log_theta
+  mu_samples_list[[batch_num + 1]] <- updated_samples$mu
+  tau_samples_list[[batch_num + 1]] <- updated_samples$tau
+  lambda_samples_list[[batch_num + 1]] <- updated_samples$lambda
+  
+  print(paste("Samples stored for batch:", batch_num + 1))
+}
+
+print("Batch processing completed.")
+```
+
+
+
+To access the appropriate dataframe:
+
+```{r}
+for (batch_num in 1:length(log_theta_samples_list)) {
+  assign(paste0("log_theta_samples_for_batch_", batch_num), log_theta_samples_list[[batch_num]])
+  assign(paste0("mu_samples_for_batch_", batch_num), mu_samples_list[[batch_num]])
+  assign(paste0("tau_samples_for_batch_", batch_num), tau_samples_list[[batch_num]])
+  assign(paste0("lambda_samples_for_batch_", batch_num), lambda_samples_list[[batch_num]])
+}
+```
+
+
+
+## CREATING A PREDICITVE DATAFRAME
+
+Converting pairwise matches back to names:
+
+```{r}
+pairwise_matches$player1 <- names(player_indices)[pairwise_matches$player1]
+pairwise_matches$player2 <- names(player_indices)[pairwise_matches$player2]
+```
+
+
+Creating predictive dataframe:
+
+```{r}
+predictive_dataframe_b <- pairwise_matches %>%
+  left_join(tournament_summary %>% select(EP_game_id), by = "EP_game_id")
+
+print(predictive_dataframe_b)
+```
+
+Appending probabilities:
+
+```{r}
+predictive_dataframe_b$prob_player1_wins <- NA
+predictive_dataframe_b$prob_player2_wins <- NA
+
+# function to calculate win probability
+calc_win_prob <- function(theta_samples, player1_idx, player2_idx) {
+  theta1 <- as.numeric(theta_samples[, player1_idx])
+  theta2 <- as.numeric(theta_samples[, player2_idx])
+  prob1_wins <- mean(exp(theta1) / (exp(theta1) + exp(theta2)))
+  prob2_wins <- 1 - prob1_wins
+  return(c(prob1_wins, prob2_wins))
+}
+
+# loop over each row in the predictive dataframe
+for (i in 1:nrow(predictive_dataframe_b)) {
+  # identify the batch for the current EP_game_id
+  game_id <- predictive_dataframe_b$EP_game_id[i]
+
+  # check if the game_id is part of the updating_batches
+  if (any(game_id %in% unlist(updating_batches))) {
+    # assign the appropriate posterior samples based on game_id's batch
+    if (game_id %in% updating_batches[[1]]) {
+      log_theta_samples <- log_theta_samples_for_batch_1
+    } else if (game_id %in% updating_batches[[2]]) {
+      log_theta_samples <- log_theta_samples_for_batch_2
+    } else if (game_id %in% updating_batches[[3]]) {
+      log_theta_samples <- log_theta_samples_for_batch_3
+    } else if (game_id %in% updating_batches[[4]]) {
+      log_theta_samples <- log_theta_samples_for_batch_4
+    } else if (game_id %in% updating_batches[[5]]) {
+      log_theta_samples <- log_theta_samples_for_batch_5
+    } else if (game_id %in% updating_batches[[6]]) {
+      log_theta_samples <- log_theta_samples_for_batch_6
+    } else if (game_id %in% updating_batches[[7]]) {
+      log_theta_samples <- log_theta_samples_for_batch_7
+    } else if (game_id %in% updating_batches[[8]]) {
+      log_theta_samples <- log_theta_samples_for_batch_8
+    }
+  
+    # get player names and convert to indices
+    player1_name <- predictive_dataframe_b$player1[i]
+    player2_name <- predictive_dataframe_b$player2[i]
+  
+    player1_idx <- player_indices[[player1_name]]
+    player2_idx <- player_indices[[player2_name]]
+
+    # calculate the win probabilities
+    probs <- calc_win_prob(log_theta_samples, player1_idx, player2_idx)
+  
+    # store the probabilities in the dataframe
+    predictive_dataframe_b$prob_player1_wins[i] <- probs[1]
+    predictive_dataframe_b$prob_player2_wins[i] <- probs[2]
+  }
+}
+```
+
+
+
+Getting rid of all non-predicitve data:
+
+```{r}
+predictive_dataframe_b <- predictive_dataframe_b %>%
+  drop_na()
+
+dim(predictive_dataframe_b)
+```
+
+Calculating accuracy of these predictions:
+
+```{r}
+correct_predictions <- predictive_dataframe_b %>%
+  mutate(predicted_win = ifelse(prob_player1_wins > 0.5, 1, 0)) %>%
+  summarize(accuracy = mean(predicted_win == outcome))
+
+print(correct_predictions)
+```
+Calculate log loss:
+
+```{r}
+log_loss <- predictive_dataframe_b %>%
+  mutate(log_loss = - (outcome * log(prob_player1_wins) + (1 - outcome) * log(1 - prob_player1_wins))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_dataframe_b %>%
+  mutate(brier_score = (prob_player1_wins - outcome)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
+
+
+## ODDS DATAFRAME
+
+Merging odds and predictive; messy because may be orientated the other way round.
+
+```{r}
+# merge the odds_data with the original predictive_dataframe
+merged_original <- predictive_dataframe_b %>%
+  left_join(odds_data, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_orig = golfer1_win,
+    golfer2_win_orig = golfer2_win
+  )
+
+
+# swap player1 and player2 in odds_data for the merge
+odds_data_swapped <- odds_data %>%
+  rename(
+    player1 = player2,
+    player2 = player1,
+    golfer1_win = golfer2_win,
+    golfer2_win = golfer1_win
+  )
+
+# merge the odds_data with the predictive_dataframe with swapped order
+merged_swapped <- predictive_dataframe_b %>%
+  left_join(odds_data_swapped, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_swapped = golfer1_win,
+    golfer2_win_swapped = golfer2_win
+  )
+
+
+# combine the results from the original and swapped merges
+predictive_odds_data_b <- merged_original %>%
+  left_join(merged_swapped, by = c("EP_game_id", "player1", "player2", "outcome", "start_date"))
+
+View(predictive_odds_data_b)
+
+# coalesce the columns to handle NA values and get the correct golfer1_win and golfer2_win
+predictive_odds_data_b <- predictive_odds_data_b %>%
+  mutate(
+    tournament = coalesce(tournament.x.x, tournament.x.y, tournament.y.x, tournament.y.y),
+    golfer1_win = coalesce(golfer1_win_orig, golfer1_win_swapped),
+    golfer2_win = coalesce(golfer2_win_orig, golfer2_win_swapped),
+    prob_player1_win = coalesce(prob_player1_wins.x, prob_player1_wins.y),
+    prob_player2_win = coalesce(prob_player2_wins.x, prob_player2_wins.y)
+  ) %>%
+  select(-golfer1_win_orig, -golfer2_win_orig, -golfer1_win_swapped, -golfer2_win_swapped, -tournament.x.x, -tournament.x.y, -tournament.y.x, -tournament.y.y, -prob_player1_wins.x, -prob_player1_wins.y, -prob_player2_wins.x, -prob_player2_wins.y)
+
+```
+
+Selecting relevant columns and deleting NA data:
+
+```{r}
+predictive_odds_data_b <- predictive_odds_data_b %>%
+  select(EP_game_id, start_date, tournament, player1, player2, outcome, prob_player1_win, prob_player2_win, golfer1_win, golfer2_win )
+
+predictive_odds_data_b <- predictive_odds_data_b %>%
+  drop_na()
+```
+
+Dimensions:
+
+```{r}
+dim(predictive_odds_data_b)
+```
+
+Calculating accuracy of these predictions:
+
+```{r}
+correct_predictions <- predictive_odds_data_b %>%
+  mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0)) %>%
+  summarize(accuracy = mean(predicted_win == outcome))
+
+print(correct_predictions)
+```
+
+Calculate log loss:
+
+```{r}
+log_loss <- predictive_odds_data_b %>%
+  mutate(log_loss = - (outcome * log(prob_player1_win) + (1 - outcome) * log(1 - prob_player1_win))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_odds_data_b %>%
+  mutate(brier_score = (prob_player1_win - outcome)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
