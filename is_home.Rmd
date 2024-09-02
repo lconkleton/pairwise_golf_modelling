@@ -122,7 +122,7 @@ filtered_rounds <- rounds %>%
 
 ## 2. CREATING A PAIRWISE COMPARISON DATASET
 
-Create a dataset with every single match-up in that time period. Can be modified to be grouped via 'EP_game_ID' or by 'tournament'. Similarly, is it easier to use indexes for the golfers or their names? For tournaments, need to sort by ID as there will be repetitions (two years means 2x each tournament).
+Create a dataset with every single match-up in that time period. 
 
 
 ```{r}
