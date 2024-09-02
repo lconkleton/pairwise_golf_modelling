@@ -1,0 +1,754 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/lukeconkleton/Library/Mobile Documents/com~apple~CloudDocs/Documents/UCL Project/Data")
+```
+
+```{r, include=FALSE}
+library(tidyverse)
+library(BradleyTerry2)
+library(tidyr)
+library(zoo)
+library(corrplot)
+```
+
+```{r}
+rounds_data <- readRDS("roundData2018-2022.rds")
+odds_data <- readRDS("oddsData2018-2022.rds")
+```
+
+## 1. DATA WRANGLING & FEATURE SELECTION
+
+Subsetting dataframe to only include pre-covid data. Creating a new dataframe to only inlcude variables of interest; golfer, tournament, major, final position and date.
+
+```{r}
+rounds_data <- rounds_data %>% filter(year %in% c('2018', '2019'))
+```
+
+Engineering a feature for whether or not the golfer is playing at 'home':
+
+```{r}
+rounds_data$is.home <- ifelse(rounds_data$player_country == rounds_data$tournament_country, 1, 0)
+```
+
+```{r}
+rounds <- data.frame(
+  EP_game_id = rounds_data$EP_game_id,
+  tournament = rounds_data$event_name,
+  major = rounds_data$is_major,
+  golfer_id = rounds_data$player_id,
+  golfer = rounds_data$player_name,
+  final_position = rounds_data$final_position,
+  start_date = rounds_data$competition_start_date, 
+  times_played_course = rounds_data$times_played_course,
+  is.home = rounds_data$is.home
+)
+
+rounds <- rounds %>%
+  distinct()
+```
+
+Only keeping a variable for times played course pre-tournament.
+
+```{r}
+rounds <- rounds %>%
+  group_by(
+    EP_game_id, tournament, golfer_id, start_date) %>%
+  slice_min(
+    times_played_course) %>% #takes the minimum value of the datapoints
+  ungroup() %>%
+  rename(
+    times_played_course_pre_tournament = times_played_course)
+```
+
+Only considering the relevant time frame:
+
+```{r}
+odds_data$competition_start_date <- as.Date(odds_data$competition_start_date)
+
+odds_data <- odds_data %>% filter(format(competition_start_date, "%Y") %in% c("2018", "2019"))
+
+odds_data <- odds_data %>%
+  select(EP_game_id, event_name, SMARTODDS_golfer1_name, SMARTODDS_golfer2_name, golfer1_win, golfer2_win) %>%
+  rename(
+    player1 = SMARTODDS_golfer1_name,
+    player2 = SMARTODDS_golfer2_name,
+    tournament = event_name
+  )
+```
+
+More tournaments included in rounds data set comparatively:
+
+```{r}
+length(unique(odds_data$EP_game_id))
+length(unique(rounds_data$EP_game_id))
+```
+
+How many times does each golfer appear in the odds dataframe?
+
+Subsetting the rounds dataset to only include golfers who have made over 50 appearances in the odds dataset:
+
+```{r}
+odds_golfers <- c(odds_data$player1, odds_data$player2)
+length(unique(odds_golfers))
+
+# how many appearances in the odds data frame
+golfer_counts <- data.frame(golfer = odds_golfers) %>%
+  group_by(golfer) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+players_over_50 <- golfer_counts %>%
+  filter(count >= 50)
+
+dim(players_over_50)
+```
+
+
+```{r}
+# Filter the original dataframe to keep only those players
+filtered_rounds_data <- rounds_data %>%
+  filter(player_name %in% players_over_50$golfer)
+
+# Filter Rounds Dataframe
+
+filtered_rounds <- rounds %>%
+  filter(golfer %in% players_over_50$golfer) %>%
+  filter(!is.na(final_position) & final_position != 0)
+```
+
+## 2. CREATING A PAIRWISE COMPARISON DATASET
+
+Create a dataset with every single match-up in that time period. 
+
+```{r}
+create_pairs <- function(df) {
+  pairs <- expand.grid(golfer_A = df$golfer_id, golfer_B = df$golfer_id)
+  pairs <- pairs[pairs$golfer_A != pairs$golfer_B, ]
+  
+  golfer_A_indices <- match(pairs$golfer_A, df$golfer_id)
+  golfer_B_indices <- match(pairs$golfer_B, df$golfer_id)
+  
+  if (length(golfer_A_indices) == 0 || length(golfer_B_indices) == 0) {
+    return(data.frame()) 
+  }
+  
+  result <- data.frame(
+    golfer_A = df$golfer[golfer_A_indices],
+    golfer_B = df$golfer[golfer_B_indices],
+    final_position_A = df$final_position[golfer_A_indices],
+    final_position_B = df$final_position[golfer_B_indices],
+    start_date = df$start_date[golfer_A_indices],
+    major = df$major[golfer_A_indices],
+    EP_game_id = df$EP_game_id[golfer_A_indices],
+    tournament = df$tournament[golfer_A_indices],
+    playerA_times_played = df$times_played_course_pre_tournament[golfer_A_indices],
+    playerB_times_played = df$times_played_course_pre_tournament[golfer_B_indices],
+    is.home.A = df$is.home[golfer_A_indices],
+    is.home.B = df$is.home[golfer_B_indices]
+  )
+  
+  return(result)
+}
+
+# apply the function to each tournament
+pairwise_matches <- filtered_rounds %>%
+  group_by(EP_game_id) %>%
+  do({
+    result <- create_pairs(.)
+    if (nrow(result) > 0) {
+      result$EP_game_id <- .$EP_game_id[1]
+    }
+    result
+  }) %>%
+  ungroup()
+
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    result_A = ifelse(final_position_A < final_position_B, 1, 0),
+    result_B = ifelse(final_position_B < final_position_A, 1, 0)
+  )
+
+```
+
+Ensure that there are no duplicate results in the dataset and that the data is ordered temporally. Will need to be amended if adding variables.
+
+```{r}
+# ensure each pair is in a consistent order
+pairwise_matches <- pairwise_matches %>%
+  rowwise() %>%
+  mutate(
+    golfer_A_sorted = ifelse(golfer_A < golfer_B, golfer_A, golfer_B),
+    golfer_B_sorted = ifelse(golfer_A < golfer_B, golfer_B, golfer_A),
+    final_position_A_sorted = ifelse(golfer_A < golfer_B, final_position_A, final_position_B),
+    final_position_B_sorted = ifelse(golfer_A < golfer_B, final_position_B, final_position_A),
+    result_A_sorted = ifelse(golfer_A < golfer_B, result_A, result_B),
+    result_B_sorted = ifelse(golfer_A < golfer_B, result_B, result_A),
+    is.home_A_sorted = ifelse(golfer_A < golfer_B, is.home.A, is.home.B),
+    is.home_B_sorted = ifelse(golfer_A < golfer_B, is.home.B, is.home.A),
+    times_played_A_sorted = ifelse(golfer_A < golfer_B, playerA_times_played, playerB_times_played),
+    times_played_B_sorted = ifelse(golfer_A < golfer_B, playerB_times_played, playerA_times_played)
+  ) %>%
+  ungroup()
+
+# add home advantage columns after sorting
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    home_advantage_A = ifelse(is.home_A_sorted == 1 & is.home_B_sorted == 0, 1, 0),
+    home_advantage_B = ifelse(is.home_A_sorted == 0 & is.home_B_sorted == 1, 1, 0)
+  )
+
+# remove duplicates based on the sorted pairs and the tournament
+pairwise_matches <- pairwise_matches %>%
+  select(EP_game_id, tournament, golfer_A_sorted, golfer_B_sorted, final_position_A_sorted, final_position_B_sorted, 
+         result_A_sorted, result_B_sorted, start_date, major, times_played_A_sorted, times_played_B_sorted, 
+         is.home_A_sorted, is.home_B_sorted, home_advantage_A, home_advantage_B) %>%
+  distinct() %>%
+  rename(
+    golfer_A = golfer_A_sorted,
+    golfer_B = golfer_B_sorted,
+    final_position_A = final_position_A_sorted,
+    final_position_B = final_position_B_sorted,
+    result_A = result_A_sorted,
+    result_B = result_B_sorted,
+    is.home_A = is.home_A_sorted,
+    is.home_B = is.home_B_sorted,
+    times_played_A = times_played_A_sorted,
+    times_played_B = times_played_B_sorted
+  )
+
+# ensuring proper column naming for clarity
+pairwise_matches <- pairwise_matches %>%
+  rename(
+    player1 = golfer_A,
+    player2 = golfer_B,
+    score1 = result_A,
+    score2 = result_B
+  )
+
+# maintaining temporal ordering
+pairwise_matches <- pairwise_matches[order(pairwise_matches$start_date), ]
+```
+
+## 3. CREATING A ROLLING WINDOW
+
+Utilising a rolling window; takes a subset of the data and moves the window across the dataset with the window size constant(ish). The window slides forward by an observation at each step.
+
+In this, an 'observation' is a tournamnet, so the window won't be necessarily have the same number of datapoints but will have the same number of tournaments.
+
+This allows for the dynamic updating of the model as new data becomes available.
+
+```{r}
+unique_tournaments <- unique(pairwise_matches$EP_game_id)
+length(unique_tournaments)
+```
+
+This function seems to be working.
+
+```{r}
+create_rolling_windows <- function(data, tournaments, window_size) {
+  n <- length(tournaments)
+  windows <- list()
+  
+  for (start in 1:(n - window_size + 1)) {
+    end <- start + window_size - 1
+    window_tournaments <- tournaments[start:end]
+    window_data <- data[data$EP_game_id %in% window_tournaments, ]
+    windows[[length(windows) + 1]] <- window_data
+  }
+  
+  return(windows)
+}
+
+# window size (number of tournaments per window)
+window_size <- 80
+
+windows <- create_rolling_windows(pairwise_matches, unique_tournaments, window_size)
+```
+
+Create a window dataframe.
+
+```{r}
+create_window_summary <- function(windows) {
+  summary_df <- data.frame(window_number = integer(),
+                           final_EP_game_id = integer(),
+                           final_tournament = character(),
+                           start_data = character(),
+                           major = integer(),
+                           stringsAsFactors = FALSE)
+  
+  for (i in 1:(length(windows) - 1)) {
+    next_window <- windows[[i + 1]]
+    final_EP_game_id <- tail(next_window$EP_game_id, n = 1)  
+    final_tournament <- tail(next_window$tournament, n = 1)  
+    final_start_date <- tail(next_window$start_date, n = 1)  
+    final_major <- tail(next_window$major, n = 1)  
+    
+    summary_df <- rbind(summary_df, data.frame(window_number = i,
+                                               next_EP_game_id = final_EP_game_id,
+                                               next_tournament = final_tournament,
+                                               start_date = final_start_date,
+                                               major = final_major))
+  }
+  
+  return(summary_df)
+}
+
+window_summary <- create_window_summary(windows)
+```
+
+## 4. PREPARING DATA FOR TRAINING
+
+Prepare the data so it is compatible with the Bradley-Terry package.
+
+```{r}
+prepare_pairwise_data <- function(data) {
+  players <- unique(c(data$player1, data$player2))
+  
+  pairwise_data <- data.frame(
+    player1 = factor(data$player1, levels = players),
+    player2 = factor(data$player2, levels = players),
+    wins1 = data$score1,
+    wins2 = data$score2,
+    major = data$major,
+    played_before1 = data$times_played_A,
+    played_before2 = data$times_played_B,
+    is.home1 = data$is.home_A,
+    is.home2 = data$is.home_B
+  )
+  
+  pairwise_data$player1 <- data.frame(
+  player = pairwise_data$player1,
+  times_played = pairwise_data$played_before1,
+  is.home = pairwise_data$is.home1
+)
+
+pairwise_data$player2 <- data.frame(
+  player = pairwise_data$player2,
+  times_played = pairwise_data$played_before2,
+  is.home = pairwise_data$is.home2
+)
+  
+  return(pairwise_data)
+}
+
+```
+
+
+## 5. TRAINING MODEL
+
+```{r}
+train_bradley_terry4 <- function(window_data, window_number, ref_player) {
+  pairwise_data <- prepare_pairwise_data(window_data)
+  cat("Training model for window", window_number, "\n")
+  model <- BTm(cbind(wins1, wins2),
+               formula = ~ player + times_played + is.home,
+               player1 = player1, 
+               player2 = player2, 
+               data = pairwise_data,
+               id = "player",
+               refcat = ref_player)
+  return(model)
+}
+
+reference_player <- "Tommy Fleetwood" # basis of comparison
+
+models4 <- lapply(seq_len(min(100, length(windows))), function(i) {
+  train_bradley_terry4(windows[[i]], i, reference_player)
+})
+```
+
+Creating a dataframe comparing the significance levels through all the windows:
+
+```{r}
+extract_significance <- function(model_summary) {
+  # extract the coefficients table
+  coefs <- summary(model_summary)$coefficients
+  
+  # extract significance values for 'is.home' and 'times_played'
+  is_home_p_value <- coefs["is.home", "Pr(>|z|)"]
+  times_played_p_value <- coefs["times_played", "Pr(>|z|)"]
+  
+  # return as a named vector
+  return(c(is_home = is_home_p_value, times_played = times_played_p_value))
+}
+```
+
+Extracting from relevant model:
+
+```{r}
+significance_values_4 <- lapply(models4, function(model) {
+  extract_significance(model)
+})
+
+# combine the results into a data frame
+significance_df_4 <- do.call(rbind, significance_values_4)
+colnames(significance_df_4) <- c("is_home_p_value", "times_played_p_value")
+
+# convert to data frame for better display
+significance_df_4 <- as.data.frame(significance_df_4)
+
+```
+
+Checking mean of p-values:
+
+```{r}
+mean(significance_df_4$is_home_p_value, na.rm = TRUE)
+mean(significance_df_4$times_played_p_value, na.rm = TRUE)
+```
+
+Checking percentage of p-values under 5:
+
+```{r}
+percentage_under_threshold <- function(column, threshold = 0.05) {
+  mean(column < threshold) * 100
+}
+
+# apply the function to each column
+result <- significance_df_4 %>%
+  summarize(across(everything(), percentage_under_threshold))
+
+print(result)
+```
+## Creating dataframe for coefficient values
+
+```{r}
+# extract coefficients from each model and store them in a list of DataFrames
+extract_coefficients <- function(models, window_numbers, ref_player) {
+  coef_list <- lapply(window_numbers, function(i) {
+    if (i <= length(models)) {
+      model <- models[[i]]
+      coefs <- coef(model)
+      if (!(ref_player %in% names(coefs))) {
+        coefs <- c(coefs, setNames(0, ref_player))
+      }
+      data.frame(
+        Player = names(coefs),
+        Coefficient = as.numeric(coefs),
+        Window = paste("Window", i, sep = "_"),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(
+        Player = character(0),
+        Coefficient = numeric(0),
+        Window = character(0),
+        stringsAsFactors = FALSE
+      )
+    }
+  })
+  return(coef_list)
+}
+
+```
+
+Running the function for this model:
+
+```{r}
+# extract coefficients from models
+window_numbers <- seq_len(length(models4))
+coef_list <- extract_coefficients(models4, window_numbers, reference_player)
+
+# combine the list of dataframes into a single dataframes
+combined_df <- bind_rows(coef_list)
+
+# ensure the reference player is in the final dataframe
+if (!("Tommy Fleetwood" %in% combined_df$Player)) {
+  for (i in window_numbers) {
+    combined_df <- combined_df %>%
+      add_row(Player = reference_player, Coefficient = 0, Window = paste("Window", i, sep = "_"))
+  }
+}
+
+# reshape the DataFrame so each column represents a window
+final_df_4 <- combined_df %>%
+  pivot_wider(names_from = Window, values_from = Coefficient) %>%
+  arrange(Player)
+
+# remove leading dots from the 'Player' column in final_df
+final_df_4$Player <- gsub("^player", "", final_df_4$Player)
+```
+
+Creating a plot comparing how 'times_played' and 'is.home' change over time:
+
+```{r}
+covariates <- c("is.home") 
+
+selected_df <- final_df_4 %>%
+  filter(Player %in% covariates)
+
+selected_plot_df <- selected_df %>%
+  pivot_longer(cols = starts_with("Window_"), names_to = "Window", values_to = "Coefficient")
+
+selected_plot_df$Window <- factor(selected_plot_df$Window, levels = paste("Window", 1:length(windows), sep = "_"))
+
+ggplot(selected_plot_df, aes(x = Window, y = Coefficient, group = Player, color = Player)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Add horizontal line at y = 0
+  theme(legend.position = "right") +  # Include legend for clarity
+  labs(title = "Home Advantage Coefficient",
+       x = "Window", y = "Coefficient") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_discrete(
+    breaks = levels(selected_plot_df$Window)[seq(0, length(levels(selected_plot_df$Window)), by = 5)],
+    labels = seq(5, length(levels(selected_plot_df$Window)), by = 5))
+
+```
+
+
+## PREDICTIVE ANALYSIS
+
+```{r}
+predictive_dataframe_4 <- merge(pairwise_matches, window_summary, 
+                       by.x = "EP_game_id", by.y = "next_EP_game_id", all.x = TRUE) %>%
+  select(window_number, start_date.x, EP_game_id, tournament, player1, player2, final_position_A, final_position_B, score1, score2, times_played_A, times_played_B, is.home_A, is.home_B, major.x) %>%
+  na.omit() %>% # gets rid of all data prior to window 1
+  rename(major = major.x, start_date = start_date.x, player1_win = score1)
+```
+
+Now merging strengths and covariate coefficient values:
+
+```{r}
+# merging the strengths 
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+  left_join(final_df_4 %>% 
+              gather(Window, Strength, -Player) %>% 
+              mutate(Window = as.numeric(gsub("Window_", "", Window))), 
+            by = c("window_number" = "Window", "player1" = "Player")) %>%
+  rename(player1_strength = Strength) %>%
+  left_join(final_df_4 %>% 
+              gather(Window, Strength, -Player) %>% 
+              mutate(Window = as.numeric(gsub("Window_", "", Window))), 
+            by = c("window_number" = "Window", "player2" = "Player")) %>%
+  rename(player2_strength = Strength)
+
+```
+
+```{r}
+# identify the indices or rows for the covariates
+is_home_row <- which(final_df_4$Player == "is.home")
+times_played_row <- which(final_df_4$Player == "times_played")
+
+# extracting the data for merging
+is_home_coeffs <- final_df_4[is_home_row, ] %>%
+  gather(Window, is_home_coeff, -Player) %>%
+  mutate(Window = as.numeric(gsub("Window_", "", Window)))
+
+times_played_coeffs <- final_df_4[times_played_row, ] %>%
+  gather(Window, times_played_coeff, -Player) %>%
+  mutate(Window = as.numeric(gsub("Window_", "", Window)))
+
+# merging the coefficients into the predictive dataframe
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+  left_join(is_home_coeffs, by = c("window_number" = "Window")) %>%
+  left_join(times_played_coeffs, by = c("window_number" = "Window"))
+
+```
+
+Deselecting certain:
+
+```{r}
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+  select(-start_date, -final_position_A, -final_position_B, -Player.x, -Player.y)
+```
+
+Adding columns for model probabilities:
+
+```{r}
+logistic <- function(x){
+  1 / (1+exp(-x))
+}
+
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+    mutate(
+    linear_predictor_1 = player1_strength - player2_strength + 
+                         is_home_coeff * (is.home_A - is.home_B) + 
+                         times_played_coeff * (times_played_A - times_played_B),
+    linear_predictor_2 = player2_strength - player1_strength + 
+                         is_home_coeff * (is.home_B - is.home_A) + 
+                         times_played_coeff * (times_played_B - times_played_A),
+    prob_player1_win = logistic(linear_predictor_1),
+    prob_player2_win = logistic(linear_predictor_2)
+  ) %>%
+  select(-linear_predictor_1, -linear_predictor_2)
+```
+
+```{r}
+# get rid of all non-predictive data
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+  drop_na()
+
+correct_predictions <- predictive_dataframe_4 %>%
+  mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0)) %>%
+  summarize(accuracy = mean(predicted_win == player1_win))
+
+print(correct_predictions)
+```
+Calculating log loss:
+
+```{r}
+log_loss <- predictive_dataframe_4 %>%
+  mutate(log_loss = - (player1_win * log(prob_player1_win) + (1 - player1_win) * log(1 - prob_player1_win))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_dataframe_4 %>%
+  mutate(brier_score = (prob_player1_win - player1_win)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
+Accuracy per window:
+
+```{r}
+predictive_dataframe_4 <- predictive_dataframe_4 %>%
+    mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0))
+
+accuracy_per_window_4 <- predictive_dataframe_4 %>%
+    group_by(window_number) %>%  # Group by the window number
+    summarize(accuracy = mean(predicted_win == player1_win))
+
+print(accuracy_per_window_4)
+
+ggplot(accuracy_per_window_4, aes(x = window_number, y = accuracy)) +
+    geom_line(color = "blue") +
+    geom_point(color = "red") +
+    labs(
+        title = "Accuracy per Window",
+        x = "Window Number",
+        y = "Accuracy"
+    ) +
+    theme_minimal()
+```
+Correlation:
+
+```{r}
+predictive_dataframe_4$home_advantage_A <- predictive_dataframe_4$is.home_A - predictive_dataframe_4$is.home_B
+predictive_dataframe_4$times_played_difference <- predictive_dataframe_4$times_played_A - predictive_dataframe_4$times_played_B
+
+covariates_and_outcome_df <- predictive_dataframe_4[, c("home_advantage_A", 
+                                                        "times_played_difference", 
+                                                        "player1_win")]  # Replace with your actual outcome 
+corr_matrix <- cor(covariates_and_outcome_df)
+
+rownames(corr_matrix) <- c("Home Adv.", "Times Played", "Outcome")
+colnames(corr_matrix) <- c("Home Adv.", "Times Played", "Outcome")
+
+corrplot(corr_matrix, 
+         method = "color",        
+         type = "upper",         
+         tl.col = "black",     
+         tl.srt = 45,             
+         addCoef.col = "black",   
+         col = colorRampPalette(c("red", "white", "blue"))(200), 
+         mar = c(0,0,1,0))        
+```
+
+
+
+##8. PROFITABILITY ANALYSIS
+
+Merging the odds dataframe with the predictive dataframe:
+
+```{r}
+# merge the odds_data with the original predictive_dataframe
+merged_original <- predictive_dataframe_4 %>%
+  left_join(odds_data, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_orig = golfer1_win,
+    golfer2_win_orig = golfer2_win
+  )
+
+# swap player1 and player2 in odds_data for the merge
+odds_data_swapped <- odds_data %>%
+  rename(
+    player1 = player2,
+    player2 = player1,
+    golfer1_win = golfer2_win,
+    golfer2_win = golfer1_win
+  )
+
+# merge the odds_data with the predictive_dataframe with swapped order
+merged_swapped <- predictive_dataframe_4 %>%
+  left_join(odds_data_swapped, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_swapped = golfer1_win,
+    golfer2_win_swapped = golfer2_win
+  )
+
+# combine the results from the original and swapped merges
+predictive_odds_data_4 <- merged_original %>%
+  left_join(merged_swapped, by = c("EP_game_id", "player1", "player2", "player1_win",   "player1_strength", "player2_strength"))
+
+# coalesce the columns to handle NA values and get the correct golfer1_win and golfer2_win
+predictive_odds_data_4 <- predictive_odds_data_4 %>%
+  mutate(
+    tournament = coalesce(tournament.x.x, tournament.x.y, tournament.y.x, tournament.y.y),
+    golfer1_win = coalesce(golfer1_win_orig, golfer1_win_swapped),
+    golfer2_win = coalesce(golfer2_win_orig, golfer2_win_swapped),
+    prob_player1_win = coalesce(prob_player1_win.x, prob_player1_win.y),
+    prob_player2_win = coalesce(prob_player2_win.x, prob_player2_win.y)
+  ) %>%
+  select(-golfer1_win_orig, -golfer2_win_orig, -golfer1_win_swapped, -golfer2_win_swapped, -tournament.x.x, -tournament.x.y, -tournament.y.x, -tournament.y.y, -prob_player1_win.x, -prob_player1_win.y, -prob_player2_win.x, -prob_player2_win.y)
+```
+
+Selecting relevant columns and deleting data used in the first window:
+
+```{r}
+predictive_odds_data_4 <- predictive_odds_data_4 %>%
+  select(EP_game_id, tournament, player1, player2, golfer1_win, golfer2_win, prob_player1_win, prob_player2_win, player1_win )
+
+predictive_odds_data_4 <- predictive_odds_data_4 %>%
+  drop_na()
+```
+
+Calculating dimensions:
+
+```{r}
+dim(predictive_odds_data_4)
+```
+
+Calculating Accuracy:
+
+```{r}
+correct_predictions <- predictive_odds_data_4 %>%
+  mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0)) %>%
+  summarize(accuracy = mean(predicted_win == player1_win))
+
+print(correct_predictions)
+```
+
+Calculate log loss:
+
+```{r}
+log_loss <- predictive_odds_data_4 %>%
+  mutate(log_loss = - (player1_win * log(prob_player1_win) + (1 - player1_win) * log(1 - prob_player1_win))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_odds_data_4 %>%
+  mutate(brier_score = (prob_player1_win - player1_win)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
+
+
+
+
+
