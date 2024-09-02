@@ -1,0 +1,1025 @@
+---
+title: "Standard Model"
+output: html_document
+date: "2024-07-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/lukeconkleton/Library/Mobile Documents/com~apple~CloudDocs/Documents/UCL Project/Data")
+
+```
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(BradleyTerry2)
+library(elo)
+library(igraph)
+library(tidyr)
+library(zoo)
+library(forecast)
+```
+
+#############################################################################
+#############################################################################
+
+```{r}
+rounds_data <- readRDS("roundData2018-2022.rds")
+odds_data <- readRDS("oddsData2018-2022.rds")
+```
+
+## 1. DATA WRANGLING & FEATURE SELECTION
+
+Subsetting dataframe to only include pre-covid data. Creating a new dataframe to only inlcude variables of interest; golfer, tournament, major, final position and date.
+
+```{r}
+rounds_data <- rounds_data %>% filter(year %in% c('2018', '2019'))
+```
+
+Engineering a feature for whether or not the golfer is playing at 'home':
+
+```{r}
+rounds_data$is.home <- ifelse(rounds_data$player_country == rounds_data$tournament_country, 1, 0)
+```
+
+```{r}
+rounds <- data.frame(
+  EP_game_id = rounds_data$EP_game_id,
+  tournament = rounds_data$event_name,
+  major = rounds_data$is_major,
+  golfer_id = rounds_data$player_id,
+  golfer = rounds_data$player_name,
+  final_position = rounds_data$final_position,
+  start_date = rounds_data$competition_start_date, 
+  times_played_course = rounds_data$times_played_course,
+  is.home = rounds_data$is.home
+)
+
+rounds <- rounds %>%
+  distinct()
+```
+
+Only keeping a variable for times played course pre-tournament.
+
+```{r}
+rounds <- rounds %>%
+  group_by(EP_game_id, tournament, golfer_id, start_date) %>%
+  slice_min(times_played_course) %>% #takes the minimum value of the datapoints
+  ungroup() %>%
+  rename(times_played_course_pre_tournament = times_played_course)
+```
+
+
+
+Only considering the relevant time frame:
+
+```{r}
+odds_data$competition_start_date <- as.Date(odds_data$competition_start_date)
+
+odds_data <- odds_data %>% filter(format(competition_start_date, "%Y") %in% c("2018", "2019"))
+
+odds_data <- odds_data %>%
+  select(EP_game_id, event_name, SMARTODDS_golfer1_name, SMARTODDS_golfer2_name, golfer1_win, golfer2_win) %>%
+  rename(
+    player1 = SMARTODDS_golfer1_name,
+    player2 = SMARTODDS_golfer2_name,
+    tournament = event_name
+  )
+```
+
+More tournaments included in rounds data set comparatively:
+
+```{r}
+length(unique(odds_data$EP_game_id))
+length(unique(rounds_data$EP_game_id))
+```
+
+Subsetting the rounds dataset to only include golfers who have made over 50 appearances in the odds dataset:
+
+```{r}
+odds_golfers <- c(odds_data$player1, odds_data$player2)
+length(unique(odds_golfers))
+
+# how many appearances in the odds data frame
+golfer_counts <- data.frame(golfer = odds_golfers) %>%
+  group_by(golfer) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+players_over_50 <- golfer_counts %>%
+  filter(count >= 50)
+
+dim(players_over_50)
+```
+
+
+```{r}
+# Filter the original dataframe to keep only those players
+filtered_rounds_data <- rounds_data %>%
+  filter(player_name %in% players_over_50$golfer)
+
+# Filter Rounds Dataframe
+
+filtered_rounds <- rounds %>%
+  filter(golfer %in% players_over_50$golfer) %>%
+  filter(!is.na(final_position) & final_position != 0)
+```
+
+## 2. CREATING A PAIRWISE COMPARISON DATASET
+
+Create a dataset with every single match-up in that time period. Can be modified to be grouped via 'EP_game_ID' or by 'tournament'. Similarly, is it easier to use indexes for the golfers or their names? For tournaments, need to sort by ID as there will be repetitions (two years means 2x each tournament).
+
+
+```{r}
+# Define the create_pairs function
+create_pairs <- function(df) {
+  pairs <- expand.grid(golfer_A = df$golfer_id, golfer_B = df$golfer_id)
+  pairs <- pairs[pairs$golfer_A != pairs$golfer_B, ]
+  
+  golfer_A_indices <- match(pairs$golfer_A, df$golfer_id)
+  golfer_B_indices <- match(pairs$golfer_B, df$golfer_id)
+  
+  if (length(golfer_A_indices) == 0 || length(golfer_B_indices) == 0) {
+    return(data.frame()) 
+  }
+  
+  result <- data.frame(
+    golfer_A = df$golfer[golfer_A_indices],
+    golfer_B = df$golfer[golfer_B_indices],
+    final_position_A = df$final_position[golfer_A_indices],
+    final_position_B = df$final_position[golfer_B_indices],
+    start_date = df$start_date[golfer_A_indices],
+    major = df$major[golfer_A_indices],
+    EP_game_id = df$EP_game_id[golfer_A_indices],
+    tournament = df$tournament[golfer_A_indices],
+    playerA_times_played = df$times_played_course_pre_tournament[golfer_A_indices],
+    playerB_times_played = df$times_played_course_pre_tournament[golfer_B_indices],
+    is.home.A = df$is.home[golfer_A_indices],
+    is.home.B = df$is.home[golfer_B_indices]
+  )
+  
+  return(result)
+}
+
+# apply the function to each tournament
+pairwise_matches <- filtered_rounds %>%
+  group_by(EP_game_id) %>%
+  do({
+    result <- create_pairs(.)
+    if (nrow(result) > 0) {
+      result$EP_game_id <- .$EP_game_id[1]
+    }
+    result
+  }) %>%
+  ungroup()
+
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    result_A = ifelse(final_position_A < final_position_B, 1, 0),
+    result_B = ifelse(final_position_B < final_position_A, 1, 0)
+  )
+
+```
+
+Ensure that there are no duplicate results in the dataset and that the data is ordered temporally. Will need to be amended if adding variables.
+
+```{r}
+# ensure each pair is in a consistent order
+pairwise_matches <- pairwise_matches %>%
+  rowwise() %>%
+  mutate(
+    golfer_A_sorted = ifelse(golfer_A < golfer_B, golfer_A, golfer_B),
+    golfer_B_sorted = ifelse(golfer_A < golfer_B, golfer_B, golfer_A),
+    final_position_A_sorted = ifelse(golfer_A < golfer_B, final_position_A, final_position_B),
+    final_position_B_sorted = ifelse(golfer_A < golfer_B, final_position_B, final_position_A),
+    result_A_sorted = ifelse(golfer_A < golfer_B, result_A, result_B),
+    result_B_sorted = ifelse(golfer_A < golfer_B, result_B, result_A),
+    is.home_A_sorted = ifelse(golfer_A < golfer_B, is.home.A, is.home.B),
+    is.home_B_sorted = ifelse(golfer_A < golfer_B, is.home.B, is.home.A),
+    times_played_A_sorted = ifelse(golfer_A < golfer_B, playerA_times_played, playerB_times_played),
+    times_played_B_sorted = ifelse(golfer_A < golfer_B, playerB_times_played, playerA_times_played)
+  ) %>%
+  ungroup()
+
+# Add home advantage columns after sorting
+pairwise_matches <- pairwise_matches %>%
+  mutate(
+    home_advantage_A = ifelse(is.home_A_sorted == 1 & is.home_B_sorted == 0, 1, 0),
+    home_advantage_B = ifelse(is.home_A_sorted == 0 & is.home_B_sorted == 1, 1, 0)
+  )
+
+# Remove duplicates based on the sorted pairs and the tournament
+pairwise_matches <- pairwise_matches %>%
+  select(EP_game_id, tournament, golfer_A_sorted, golfer_B_sorted, final_position_A_sorted, final_position_B_sorted, 
+         result_A_sorted, result_B_sorted, start_date, major, times_played_A_sorted, times_played_B_sorted, 
+         is.home_A_sorted, is.home_B_sorted, home_advantage_A, home_advantage_B) %>%
+  distinct() %>%
+  rename(
+    golfer_A = golfer_A_sorted,
+    golfer_B = golfer_B_sorted,
+    final_position_A = final_position_A_sorted,
+    final_position_B = final_position_B_sorted,
+    result_A = result_A_sorted,
+    result_B = result_B_sorted,
+    is.home_A = is.home_A_sorted,
+    is.home_B = is.home_B_sorted,
+    times_played_A = times_played_A_sorted,
+    times_played_B = times_played_B_sorted
+  )
+
+# Ensuring proper column naming for clarity
+pairwise_matches <- pairwise_matches %>%
+  rename(
+    player1 = golfer_A,
+    player2 = golfer_B,
+    score1 = result_A,
+    score2 = result_B
+  )
+
+# Maintaining temporal ordering
+pairwise_matches <- pairwise_matches %>%
+  arrange(start_date, EP_game_id)
+```
+
+#############################################################################
+#############################################################################
+
+
+## 3. CREATING A ROLLING WINDOW
+
+Utilising a rolling window; takes a subset of the data and moves the window across the dataset with the window size constant(ish). The window slides forward by an observation at each step.
+
+In this, an 'observation' is a tournamnet, so the window won't be necessarily have the same number of datapoints but will have the same number of tournaments.
+
+This allows for the dynamic updating of the model as new data becomes available.
+
+```{r}
+unique_tournaments <- unique(pairwise_matches$EP_game_id)
+length(unique_tournaments)
+```
+
+This function seems to be working.
+
+```{r}
+create_rolling_windows <- function(data, tournaments, window_size) {
+  n <- length(tournaments)
+  windows <- list()
+  
+  for (start in 1:(n - window_size + 1)) {
+    end <- start + window_size - 1
+    window_tournaments <- tournaments[start:end]
+    window_data <- data[data$EP_game_id %in% window_tournaments, ]
+    windows[[length(windows) + 1]] <- window_data
+  }
+  
+  return(windows)
+}
+
+# window size (number of tournaments per window)
+window_size <- 80
+
+windows <- create_rolling_windows(pairwise_matches, unique_tournaments, window_size)
+
+## make sure function is working as expected
+
+length(windows)
+
+unique(windows[[3]]$EP_game_id)
+```
+
+Create a window dataframe.
+
+```{r}
+create_window_summary <- function(windows) {
+  summary_df <- data.frame(window_number = integer(),
+                           final_EP_game_id = integer(),
+                           final_tournament = character(),
+                           start_data = character(),
+                           major = integer(),
+                           stringsAsFactors = FALSE)
+  
+  for (i in 1:(length(windows) - 1)) {
+    next_window <- windows[[i + 1]]
+    final_EP_game_id <- tail(next_window$EP_game_id, n = 1)  
+    final_tournament <- tail(next_window$tournament, n = 1)  
+    final_start_date <- tail(next_window$start_date, n = 1)  
+    final_major <- tail(next_window$major, n = 1)  
+    
+    summary_df <- rbind(summary_df, data.frame(window_number = i,
+                                               next_EP_game_id = final_EP_game_id,
+                                               next_tournament = final_tournament,
+                                               start_date = final_start_date,
+                                               major = final_major))
+  }
+  
+  return(summary_df)
+}
+
+window_summary <- create_window_summary(windows)
+
+```
+
+## 4. PREPARING DATA FOR TRAINING
+
+Prepare the data so it is compatible with the Bradley-Terry package.
+
+```{r}
+prepare_pairwise_data <- function(data) {
+  players <- unique(c(data$player1, data$player2))
+  
+  pairwise_data <- data.frame(
+    player1 = factor(data$player1, levels = players),
+    player2 = factor(data$player2, levels = players),
+    wins1 = data$score1,
+    wins2 = data$score2,
+    major = data$major,
+    played_before1 = data$times_played_A,
+    played_before2 = data$times_played_B,
+    is.home1 = data$is.home_A,
+    is.home2 = data$is.home_B
+  )
+  
+  return(pairwise_data)
+}
+
+```
+
+```{r}
+# Standardize factor levels function
+standardize_levels <- function(data, all_players) {
+  data$player1 <- factor(data$player1, levels = all_players)
+  data$player2 <- factor(data$player2, levels = all_players)
+  return(data)
+}
+
+# Collect all unique player names across all windows
+all_players <- unique(unlist(lapply(windows, function(window) {
+  unique(c(window$player1, window$player2))
+})))
+
+```
+
+## 5. TRAINING MODEL
+
+Train the B-T model for each individual window. At the moment only shows the first 5 windows. If including a reference player in the 'refcat' argument, their strength will be = 0 for every window.
+
+```{r}
+# Train Bradley-Terry model
+train_bradley_terry <- function(window_data, window_number, ref_player) {
+  pairwise_data <- prepare_pairwise_data(window_data)
+  cat("Training model for window", window_number, "\n")
+  model <- BTm(cbind(wins1, wins2), 
+               player1 = player1, 
+               player2 = player2, 
+               data = pairwise_data,
+               id = "player",
+               refcat = ref_player)
+  return(model)
+}
+
+reference_player <- "Tommy Fleetwood" # basis of comparison
+
+# can choose how many windows to go through
+
+models <- lapply(seq_len(min(100, length(windows))), function(i) {
+  train_bradley_terry(windows[[i]], i, reference_player)
+})
+
+
+```
+
+Create a dataframe to compare the coefficients from each window (model)
+
+```{r}
+# extract coefficients from each model and store them in a list of DataFrames
+extract_coefficients <- function(models, window_numbers, ref_player) {
+  coef_list <- lapply(window_numbers, function(i) {
+    if (i <= length(models)) {
+      model <- models[[i]]
+      coefs <- coef(model)
+      if (!(ref_player %in% names(coefs))) {
+        coefs <- c(coefs, setNames(0, ref_player))
+      }
+      data.frame(
+        Player = names(coefs),
+        Coefficient = as.numeric(coefs),
+        Window = paste("Window", i, sep = "_"),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(
+        Player = character(0),
+        Coefficient = numeric(0),
+        Window = character(0),
+        stringsAsFactors = FALSE
+      )
+    }
+  })
+  return(coef_list)
+}
+
+
+# Extract coefficients from models
+window_numbers <- seq_len(length(models))
+coef_list <- extract_coefficients(models, window_numbers, reference_player)
+
+# Combine the list of DataFrames into a single DataFrame
+combined_df <- bind_rows(coef_list)
+
+# Ensure the reference player is in the final DataFrame
+if (!("Tommy Fleetwood" %in% combined_df$Player)) {
+  for (i in window_numbers) {
+    combined_df <- combined_df %>%
+      add_row(Player = reference_player, Coefficient = 0, Window = paste("Window", i, sep = "_"))
+  }
+}
+
+# Reshape the DataFrame so each column represents a window
+final_df <- combined_df %>%
+  pivot_wider(names_from = Window, values_from = Coefficient) %>%
+  arrange(Player)
+
+# Remove leading dots from the 'Player' column in final_df
+final_df$Player <- gsub("^player", "", final_df$Player)
+```
+
+Plot the coefficient values to assess whether these are respectable results.
+
+Selecting certain golfers to visualise.
+
+```{r}
+selected_golfers <- c("Tommy Fleetwood", "Brooks Koepka", "Tony Finau", "Patrick Reed", "Bryson DeChambeau", "Rory McIlroy")
+
+selected_df <- final_df %>%
+  filter(Player %in% selected_golfers)
+
+selected_plot_df <- selected_df %>%
+  pivot_longer(cols = starts_with("Window_"), names_to = "Window", values_to = "Coefficient")
+
+# Ensure Window is an ordered factor
+selected_plot_df$Window <- factor(selected_plot_df$Window, levels = paste("Window", 1:length(windows), sep = "_"))
+
+# Plot the coefficients for the selected golfers across windows
+ggplot(selected_plot_df, aes(x = Window, y = Coefficient, group = Player, color = Player)) +
+  geom_line() +
+  geom_point() +
+  theme(legend.position = "right") +  # Include legend for clarity
+  labs(title = "Bradley-Terry Log-Strengths Across Windows for Selected Golfers", subtitle = "Reference Player: Tommy Fleetwood",
+       x = "Window", y = "Coefficient") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_discrete(
+    breaks = levels(selected_plot_df$Window)[seq(0, length(levels(selected_plot_df$Window)), by = 5)],
+    labels = seq(5, length(levels(selected_plot_df$Window)), by = 5))
+```
+
+
+## PREDICTION ANALYSIS
+
+```{r}
+predictive_dataframe_s <- merge(pairwise_matches, window_summary, 
+                       by.x = "EP_game_id", by.y = "next_EP_game_id", all.x = TRUE) %>%
+  select(window_number, EP_game_id, player1, player2, tournament, score1, score2, major.x) %>%
+  rename(player1_win = score1, major = major.x)
+```
+
+Now merging strengths:
+
+```{r}
+# merging the strengths 
+predictive_dataframe_s <- predictive_dataframe_s %>%
+  left_join(final_df %>% 
+              gather(Window, Strength, -Player) %>% 
+              mutate(Window = as.numeric(gsub("Window_", "", Window))), 
+            by = c("window_number" = "Window", "player1" = "Player")) %>%
+  rename(player1_strength = Strength) %>%
+  left_join(final_df %>% 
+              gather(Window, Strength, -Player) %>% 
+              mutate(Window = as.numeric(gsub("Window_", "", Window))), 
+            by = c("window_number" = "Window", "player2" = "Player")) %>%
+  rename(player2_strength = Strength)
+```
+
+Adding column for model probabilities. The output of the package produces log strengths of players so probabilities have to be calculated accordingly:
+
+```{r}
+logistic <- function(x){
+  1 / (1+exp(-x))
+}
+
+predictive_dataframe_s <- predictive_dataframe_s %>%
+  mutate(
+    prob_player1_win = logistic(player1_strength - player2_strength),
+    prob_player2_win = logistic(player2_strength - player1_strength)
+  )
+```
+
+Calculating Accuracy:
+
+```{r}
+# get rid of all non-predictive data
+predictive_dataframe_s <- predictive_dataframe_s %>%
+  drop_na()
+
+correct_predictions <- predictive_dataframe_s %>%
+  mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0)) %>%
+  summarize(
+    accuracy = mean(predicted_win == player1_win),
+    accuracy_sd = sd(predicted_win == player1_win),  # Standard deviation of accuracy
+    n = n(),  # Sample size
+    accuracy_se = accuracy_sd / sqrt(n),  # Standard error
+    ci_lower = accuracy - qnorm(0.975) * accuracy_se,  # Lower bound of 95% CI
+    ci_upper = accuracy + qnorm(0.975) * accuracy_se   # Upper bound of 95% CI
+  )
+
+# Print the results
+print(correct_predictions)
+```
+
+```{r}
+dim(predictive_dataframe_s)
+```
+
+Calculating log loss:
+
+```{r}
+log_loss <- predictive_dataframe_s %>%
+  mutate(log_loss = - (player1_win * log(prob_player1_win) + (1 - player1_win) * log(1 - prob_player1_win))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_dataframe_s %>%
+  mutate(brier_score = (prob_player1_win - player1_win)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
+
+Creating a calibration plot:
+
+```{r}
+# Create bins for predicted probabilities
+predictive_dataframe_s <- predictive_dataframe_s %>%
+  mutate(prob_bin = cut(prob_player1_win, breaks = seq(0, 1, by = 0.2), include.lowest = TRUE))
+
+# Calculate the observed win rate in each bin
+calibration_data <- predictive_dataframe_s %>%
+  group_by(prob_bin) %>%
+  summarize(observed_win_rate = mean(player1_win),
+            predicted_win_rate = mean(prob_player1_win),
+            count = n())
+
+# Plot the calibration plot
+ggplot(calibration_data, aes(x = predicted_win_rate, y = observed_win_rate)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Calibration Plot", x = "Predicted Win Rate", y = "Observed Win Rate")
+```
+
+
+##8. PROFITABILITY ANALYSIS
+
+Merging the odds dataframe with the predictive dataframe:
+
+```{r}
+# Step 1: Merge with Original Order
+# Merge the odds_data with the original predictive_dataframe
+merged_original <- predictive_dataframe_s %>%
+  left_join(odds_data, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_orig = golfer1_win,
+    golfer2_win_orig = golfer2_win
+  )
+
+# Step 2: Merge with Swapped Order
+# Swap player1 and player2 in odds_data for the merge
+odds_data_swapped <- odds_data %>%
+  rename(
+    player1 = player2,
+    player2 = player1,
+    golfer1_win = golfer2_win,
+    golfer2_win = golfer1_win
+  )
+
+# Merge the odds_data with the predictive_dataframe with swapped order
+merged_swapped <- predictive_dataframe_s %>%
+  left_join(odds_data_swapped, by = c("EP_game_id", "player1", "player2")) %>%
+  rename(
+    golfer1_win_swapped = golfer1_win,
+    golfer2_win_swapped = golfer2_win
+  )
+
+# Step 3: Combine the Results
+# Combine the results from the original and swapped merges
+predictive_odds_data_s <- merged_original %>%
+  left_join(merged_swapped, by = c("EP_game_id", "player1", "player2", "player1_win",   "player1_strength", "player2_strength", "major"))
+
+# Coalesce the columns to handle NA values and get the correct golfer1_win and golfer2_win
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  mutate(
+    tournament = coalesce(tournament.x.x, tournament.x.y, tournament.y.x, tournament.y.y),
+    golfer1_win = coalesce(golfer1_win_orig, golfer1_win_swapped),
+    golfer2_win = coalesce(golfer2_win_orig, golfer2_win_swapped),
+    prob_player1_win = coalesce(prob_player1_win.x, prob_player1_win.y),
+    prob_player2_win = coalesce(prob_player2_win.x, prob_player2_win.y)
+  ) %>%
+  select(-golfer1_win_orig, -golfer2_win_orig, -golfer1_win_swapped, -golfer2_win_swapped, -tournament.x.x, -tournament.x.y, -tournament.y.x, -tournament.y.y, -prob_player1_win.x, -prob_player1_win.y, -prob_player2_win.x, -prob_player2_win.y,  window_number.x, major) %>%
+  rename(window_number = window_number.x)
+```
+
+Selecting relevant columns and deleting data used in the first window:
+
+```{r}
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  select(EP_game_id, tournament, player1, player2, golfer1_win, golfer2_win, prob_player1_win, prob_player2_win, player1_win, window_number, major)
+
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  drop_na()
+```
+
+Calculating dimensions:
+
+```{r}
+dim(predictive_odds_data_s)
+```
+
+
+Calculating Accuracy:
+
+```{r}
+correct_predictions <- predictive_odds_data_s %>%
+  mutate(predicted_win = ifelse(prob_player1_win > 0.5, 1, 0)) %>%
+  summarize(accuracy = mean(predicted_win == player1_win))
+
+print(correct_predictions)
+```
+Calculate log loss:
+
+```{r}
+log_loss <- predictive_odds_data_s %>%
+  mutate(log_loss = - (player1_win * log(prob_player1_win) + (1 - player1_win) * log(1 - prob_player1_win))) %>%
+  summarize(mean_log_loss = mean(log_loss))
+
+print(log_loss)
+```
+Calculating Brier Score:
+
+```{r}
+brier_score <- predictive_odds_data_s %>%
+  mutate(brier_score = (prob_player1_win - player1_win)^2) %>%
+  summarize(mean_brier_score = mean(brier_score))
+
+print(brier_score)
+```
+
+Formulating a betting strategy. 
+1. Calculate implied probabilities from Odds (1/odds)
+2. Identify the value bets (prob greater than implied)
+3. Two stake strategies, Kelly and unit (calculate for both)
+  - Total Stake, Total pnL RoI
+  - Total EV RoI
+
+Adding a column with implied probabilities:
+
+```{r}
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  mutate(
+    implied_prob_player1 = 1 / golfer1_win,
+    implied_prob_player2 = 1 / golfer2_win
+  )
+```
+
+```{r}
+# Filter the data frame to only include rows where both final columns are FALSE
+filtered_df <- predictive_odds_data_s[predictive_odds_data_s$value_bet_player1 == FALSE & predictive_odds_data_s$value_bet_player2 == FALSE, ]
+```
+
+
+Identify the value bets where model's predicted probability is greater than the bookmaker's implied probability:
+
+```{r}
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  mutate(
+    value_bet_player1 = (prob_player1_win - implied_prob_player1) > 0,
+    value_bet_player2 = (prob_player2_win - implied_prob_player2) > 0 
+  )
+
+# filtering out the dataframe for which both value_bets are FALSE:
+
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  filter(value_bet_player1 == TRUE | value_bet_player2 == TRUE)
+```
+
+Creating two dataframes for stake strategy comparisons:
+
+```{r}
+predictive_odds_data_s <- predictive_odds_data_s %>%
+  mutate(
+    b_player1 = golfer1_win -1,
+    b_player2 = golfer2_win -1, 
+         
+    q_player1 = 1 - prob_player1_win,
+    q_player2 = 1 - prob_player2_win,
+    
+    kelly_fraction_player1 = ifelse(value_bet_player1, 
+                                 (b_player1 * prob_player1_win - q_player1) / b_player1, 
+                                 0),
+    kelly_fraction_player2 = ifelse(value_bet_player2, 
+                                 (b_player2 * prob_player2_win - q_player2) / b_player2, 
+                                 0)) %>%
+  select(-b_player1, -b_player2, - q_player1, -q_player2)
+```
+
+
+Implementing 3 Strategies:
+
+
+```{r}
+bankroll_kelly <- 1000
+bankroll_half_kelly <- 1000
+bankroll_unit <- 1000
+
+# Start with the initial bankroll, no stakes, no profit/loss, and no expected value
+bankroll_kelly_progress <- c(bankroll_kelly)
+stake_kelly_progress <- c(0)
+profit_loss_kelly_progress <- c(0)
+expected_value_kelly_progress <- c(0)
+
+bankroll_half_kelly_progress <- c(bankroll_half_kelly)
+stake_half_kelly_progress <- c(0)
+profit_loss_half_kelly_progress <- c(0)
+expected_value_half_kelly_progress <- c(0)
+
+bankroll_unit_progress <- c(bankroll_unit)
+stake_unit_progress <- c(0)
+profit_loss_unit_progress <- c(0)
+expected_value_unit_progress <- c(0)
+
+# Add an initial window 0 to represent the starting state
+windows <- c(0, sort(unique(predictive_odds_data_s$window_number)))
+```
+
+
+```{r}
+for (window in windows[-1]) {  # Skip the first window 0 as it's already initialized
+    # Filter bets for the current window
+    bets_in_window <- subset(predictive_odds_data_s, window_number == window)
+    
+    # Calculate total Kelly fractions for normalization if necessary
+    total_fraction <- sum(bets_in_window$kelly_fraction_player1) + sum(bets_in_window$kelly_fraction_player2)
+    if (total_fraction > 1) {
+        normalization_factor <- 1 / total_fraction
+        bets_in_window$kelly_fraction_player1 <- bets_in_window$kelly_fraction_player1 * normalization_factor
+        bets_in_window$kelly_fraction_player2 <- bets_in_window$kelly_fraction_player2 * normalization_factor
+    } else {
+        normalization_factor <- 1
+    }
+
+    # Reset stakes, profits/losses, and expected value for the current window
+    stake_kelly_window <- 0
+    profit_loss_kelly_window <- 0
+    expected_value_kelly_window <- 0
+    
+    stake_half_kelly_window <- 0
+    profit_loss_half_kelly_window <- 0
+    expected_value_half_kelly_window <- 0
+    
+    stake_unit_window <- 0
+    profit_loss_unit_window <- 0
+    expected_value_unit_window <- 0
+    
+    # Kelly Stake
+    for (i in 1:nrow(bets_in_window)) {
+        bet <- bets_in_window[i, ]
+        
+        if (bet$value_bet_player1) {
+            stake_kelly <- bankroll_kelly * bet$kelly_fraction_player1
+            stake_kelly_window <- stake_kelly_window + stake_kelly
+            
+            expected_value_kelly <- stake_kelly * bet$golfer1_win - stake_kelly * (1 - bet$golfer1_win)
+            expected_value_kelly_window <- expected_value_kelly_window + expected_value_kelly
+            
+            if (bet$player1_win == 1) {
+                profit_loss_kelly_window <- profit_loss_kelly_window + stake_kelly * (bet$golfer1_win - 1)
+            } else {
+                profit_loss_kelly_window <- profit_loss_kelly_window - stake_kelly
+            }
+        }
+        
+        if (bet$value_bet_player2) {
+            stake_kelly <- bankroll_kelly * bet$kelly_fraction_player2
+            stake_kelly_window <- stake_kelly_window + stake_kelly
+            
+            expected_value_kelly <- stake_kelly * bet$golfer2_win - stake_kelly * (1 - bet$golfer2_win)
+            expected_value_kelly_window <- expected_value_kelly_window + expected_value_kelly
+            
+            if (bet$player1_win == 0) {
+                profit_loss_kelly_window <- profit_loss_kelly_window + stake_kelly * (bet$golfer2_win - 1)
+            } else {
+                profit_loss_kelly_window <- profit_loss_kelly_window - stake_kelly
+            }
+        }
+    }
+    
+    # Update bankroll after the window
+    bankroll_kelly <- bankroll_kelly + profit_loss_kelly_window
+
+    # Store the results for Kelly Stake
+    bankroll_kelly_progress <- c(bankroll_kelly_progress, bankroll_kelly)
+    stake_kelly_progress <- c(stake_kelly_progress, stake_kelly_window)
+    profit_loss_kelly_progress <- c(profit_loss_kelly_progress, profit_loss_kelly_window)
+    expected_value_kelly_progress <- c(expected_value_kelly_progress, expected_value_kelly_window)
+    
+    # Repeat similar steps for Half Kelly Stake and Unit Stake
+    # Half Kelly Stake
+    for (i in 1:nrow(bets_in_window)) {
+        bet <- bets_in_window[i, ]
+        
+        if (bet$value_bet_player1) {
+            stake_half_kelly <- bankroll_half_kelly * (bet$kelly_fraction_player1 / 2)
+            stake_half_kelly_window <- stake_half_kelly_window + stake_half_kelly
+            
+            expected_value_half_kelly <- stake_half_kelly * bet$golfer1_win - stake_half_kelly * (1 - bet$golfer1_win)
+            expected_value_half_kelly_window <- expected_value_half_kelly_window + expected_value_half_kelly
+            
+            if (bet$player1_win == 1) {
+                profit_loss_half_kelly_window <- profit_loss_half_kelly_window + stake_half_kelly * (bet$golfer1_win - 1)
+            } else {
+                profit_loss_half_kelly_window <- profit_loss_half_kelly_window - stake_half_kelly
+            }
+        }
+        
+        if (bet$value_bet_player2) {
+            stake_half_kelly <- bankroll_half_kelly * (bet$kelly_fraction_player2 / 2)
+            stake_half_kelly_window <- stake_half_kelly_window + stake_half_kelly
+            
+            expected_value_half_kelly <- stake_half_kelly * bet$golfer2_win - stake_half_kelly * (1 - bet$golfer2_win)
+            expected_value_half_kelly_window <- expected_value_half_kelly_window + expected_value_half_kelly
+            
+            if (bet$player1_win == 0) {
+                profit_loss_half_kelly_window <- profit_loss_half_kelly_window + stake_half_kelly * (bet$golfer2_win - 1)
+            } else {
+                profit_loss_half_kelly_window <- profit_loss_half_kelly_window - stake_half_kelly
+            }
+        }
+    }
+    
+    bankroll_half_kelly <- bankroll_half_kelly + profit_loss_half_kelly_window
+    
+    bankroll_half_kelly_progress <- c(bankroll_half_kelly_progress, bankroll_half_kelly)
+    stake_half_kelly_progress <- c(stake_half_kelly_progress, stake_half_kelly_window)
+    profit_loss_half_kelly_progress <- c(profit_loss_half_kelly_progress, profit_loss_half_kelly_window)
+    expected_value_half_kelly_progress <- c(expected_value_half_kelly_progress, expected_value_half_kelly_window)
+    
+    # Unit Stake
+    total_unit_fraction <- nrow(bets_in_window) * 0.05
+    if (total_unit_fraction > 1) {
+        normalization_factor <- 1 / total_unit_fraction
+    } else {
+        normalization_factor <- 1
+    }
+    
+    for (i in 1:nrow(bets_in_window)) {
+        bet <- bets_in_window[i, ]
+        stake_unit <- bankroll_unit * 0.05 * normalization_factor
+        stake_unit_window <- stake_unit_window + stake_unit
+        
+        expected_value_unit <- stake_unit * bet$golfer1_win - stake_unit * (1 - bet$golfer1_win)
+        expected_value_unit_window <- expected_value_unit_window + expected_value_unit
+        
+        if (bet$value_bet_player1) {
+            if (bet$player1_win == 1) {
+                profit_loss_unit_window <- profit_loss_unit_window + stake_unit * (bet$golfer1_win - 1)
+            } else {
+                profit_loss_unit_window <- profit_loss_unit_window - stake_unit
+            }
+        }
+        
+        if (bet$value_bet_player2) {
+            if (bet$player1_win == 0) {
+                profit_loss_unit_window <- profit_loss_unit_window + stake_unit * (bet$golfer2_win - 1)
+            } else {
+                profit_loss_unit_window <- profit_loss_unit_window - stake_unit
+            }
+        }
+    }
+    
+    bankroll_unit <- bankroll_unit + profit_loss_unit_window
+    
+    bankroll_unit_progress <- c(bankroll_unit_progress, bankroll_unit)
+    stake_unit_progress <- c(stake_unit_progress, stake_unit_window)
+    profit_loss_unit_progress <- c(profit_loss_unit_progress, profit_loss_unit_window)
+    expected_value_unit_progress <- c(expected_value_unit_progress, expected_value_unit_window)
+}
+```
+
+Datframe for all the important metrics:
+
+```{r}
+results_s <- data.frame(
+    window = windows,
+    bankroll_kelly = bankroll_kelly_progress,
+    bankroll_half_kelly = bankroll_half_kelly_progress,
+    bankroll_unit = bankroll_unit_progress,
+    stake_kelly = stake_kelly_progress,
+    stake_half_kelly = stake_half_kelly_progress,
+    stake_unit = stake_unit_progress,
+    profit_loss_kelly = profit_loss_kelly_progress,
+    profit_loss_half_kelly = profit_loss_half_kelly_progress,
+    profit_loss_unit = profit_loss_unit_progress,
+    expected_value_kelly = expected_value_kelly_progress,
+    expected_value_half_kelly = expected_value_half_kelly_progress,
+    expected_value_unit = expected_value_unit_progress
+)
+
+# Calculate EV ROI
+results_s$ev_roi_kelly <- results_s$expected_value_kelly / results_s$stake_kelly * 100
+results_s$ev_roi_half_kelly <- results_s$expected_value_half_kelly / results_s$stake_half_kelly * 100
+results_s$ev_roi_unit <- results_s$expected_value_unit / results_s$stake_unit * 100
+
+# Calculate Actual ROI
+results_s$roi_kelly <- results_s$profit_loss_kelly / results_s$stake_kelly * 100
+results_s$roi_half_kelly <- results_s$profit_loss_half_kelly / results_s$stake_half_kelly * 100
+results_s$roi_unit <- results_s$profit_loss_unit / results_s$stake_unit * 100
+
+results_s[is.na(results_s) | results_s == Inf] <- 0
+```
+
+Actual ROI vs Expected ROI:
+
+```{r}
+filtered_results_s <- results_s %>% filter(window >= 1)
+
+# Plotting the filtered data
+ggplot(filtered_results_s, aes(x = window)) +
+  geom_line(aes(y = roi_kelly, color = "Kelly Stake", linetype = "Actual")) +
+  geom_line(aes(y = ev_roi_kelly, color = "Kelly Stake", linetype = "Expected")) +
+  geom_line(aes(y = roi_unit, color = "Unit Stake", linetype = "Actual")) +
+  geom_line(aes(y = ev_roi_unit, color = "Unit Stake", linetype = "Expected")) +
+  scale_color_manual(values = c("Kelly Stake" = "blue", "Unit Stake" = "red")) + # Custom colors
+  labs(title = "Actual vs. Expected ROI Over Time",
+       x = "Window",
+       y = "ROI (%)",
+       color = "Staking Strategy",
+       linetype = "ROI Type") +
+  theme_minimal()
+```
+
+Cumulative Profit / Loss:
+
+```{r}
+results_s$cumulative_profit_loss_kelly <- cumsum(results_s$profit_loss_kelly)
+results_s$cumulative_profit_loss_half_kelly <- cumsum(results_s$profit_loss_half_kelly)
+results_s$cumulative_profit_loss_unit <- cumsum(results_s$profit_loss_unit)
+
+ggplot(results_s, aes(x = window)) +
+    geom_line(aes(y = cumulative_profit_loss_kelly, color = "Kelly Stake")) +
+    geom_line(aes(y = cumulative_profit_loss_half_kelly, color = "Half Kelly Stake")) +
+    geom_line(aes(y = cumulative_profit_loss_unit, color = "Unit Stake")) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "steelblue") +
+    labs(title = "Cumulative Profit/Loss Over Time",
+         x = "Window",
+         y = "Cumulative Profit/Loss",
+         color = "Staking Strategy") +
+    scale_color_manual(values = c("Kelly Stake" = "blue", "Half Kelly Stake" = "red", "Unit Stake" = "green")) +
+    theme_minimal()
+```
+
+Heatmap of ROI across windows:
+
+```{r}
+results_melted <- reshape2::melt(results_s, id.vars = "window", measure.vars = c("roi_kelly", "roi_unit"))
+
+ggplot(results_melted, aes(x = window, y = variable, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = "Heatmap of ROI Across Windows",
+         x = "Window",
+         y = "Staking Strategy",
+         fill = "ROI (%)") +
+    theme_minimal()
+```
+
+Boxplot of ROI across:
+
+```{r}
+results_melted <- reshape2::melt(results_s, id.vars = "window", measure.vars = c("roi_kelly", "roi_unit"))
+
+ggplot(results_melted, aes(x = variable, y = value, fill = variable)) +
+    geom_boxplot() +
+    labs(title = "Distribution of ROI for Each Strategy",
+         x = "Staking Strategy",
+         y = "ROI (%)",
+         fill = "Staking Strategy") +
+    theme_minimal()
+```
+
+
+
+
+
