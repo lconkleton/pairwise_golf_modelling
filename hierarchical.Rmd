@@ -643,7 +643,7 @@ print(brier_score)
 
 ## ODDS DATAFRAME
 
-Merging odds and predictive; messy because may be orientated the other way round.
+Merging odds and predictive.
 
 ```{r}
 # merge the odds_data with the original predictive_dataframe
