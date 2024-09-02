@@ -3,11 +3,6 @@ title: "R Notebook"
 output: html_notebook
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = "/Users/lukeconkleton/Library/Mobile Documents/com~apple~CloudDocs/Documents/UCL Project/Data")
-```
-
 ```{r, include=FALSE}
 library(tidyverse)
 library(BradleyTerry2)
